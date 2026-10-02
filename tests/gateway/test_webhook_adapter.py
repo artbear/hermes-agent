@@ -688,6 +688,7 @@ class TestSessionIsolation:
         assert len(captured_events) == 2
         ids = {ev.source.chat_id for ev in captured_events}
         assert len(ids) == 2, "Each delivery must have a unique session chat_id"
+        assert all(ev.reply_expected is False for ev in captured_events)
 
     @pytest.mark.asyncio
     async def test_delivery_tuple_is_an_unambiguous_session_identity(self):
