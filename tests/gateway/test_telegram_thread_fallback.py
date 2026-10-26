@@ -20,10 +20,11 @@ from gateway.config import PlatformConfig, Platform
 from gateway.platforms.base import (
     SendResult,
     _reply_anchor_for_event,
+    _thread_metadata_for_event,
     _thread_metadata_for_source,
 )
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.session import build_session_key
+from gateway.session import SessionSource, build_session_key
 
 
 # ── Fake telegram.error hierarchy ──────────────────────────────────────
@@ -722,5 +723,258 @@ async def test_thread_fallback_only_fires_once():
     # Second chunk: should use thread_id=None directly (effective_thread_id
     # was cleared per-chunk but the metadata doesn't change between chunks)
     # The key point: the message was delivered despite the invalid thread
+
+
+def _private_message(*, thread_id, is_topic_message=False, reply=False, direct_topic_id=None):
+    reply_to = SimpleNamespace(message_id=10, text="older", caption=None) if reply else None
+    direct = SimpleNamespace(topic_id=direct_topic_id) if direct_topic_id is not None else None
+    return SimpleNamespace(
+        text="проверка топиков",
+        caption=None,
+        chat=SimpleNamespace(id=439339988, type="private", title=None, full_name="Artur"),
+        from_user=SimpleNamespace(id=439339988, full_name="Artur", is_bot=False, username=None),
+        message_thread_id=thread_id,
+        is_topic_message=is_topic_message,
+        reply_to_message=reply_to,
+        message_id=3001,
+        date=None,
+        direct_messages_topic=direct,
+        quote=None,
+    )
+
+
+def test_private_new_topic_without_is_topic_flag_keeps_its_own_lane():
+    """A freshly created DM topic must not be dropped when is_topic_message is missing."""
+    adapter = _make_adapter()
+    event = adapter._build_message_event(
+        _private_message(thread_id=400001, is_topic_message=False), MessageType.TEXT,
+    )
+    assert event.source.thread_id == "400001"
+    assert build_session_key(event.source) == "agent:main:telegram:dm:439339988:400001"
+
+
+def test_private_reply_anchor_without_topic_flag_does_not_fork():
+    """Reply-UI anchors in a private chat are not topic ids."""
+    adapter = _make_adapter()
+    event = adapter._build_message_event(
+        _private_message(thread_id=2990, is_topic_message=False, reply=True), MessageType.TEXT,
+    )
+    assert event.source.thread_id is None
+
+
+def test_private_direct_messages_topic_id_is_the_lane():
+    adapter = _make_adapter()
+    event = adapter._build_message_event(
+        _private_message(thread_id=None, direct_topic_id=400002), MessageType.TEXT,
+    )
+    assert event.source.thread_id == "400002"
+
+
+def test_forum_thread_id_wins_over_direct_messages_topic():
+    """Outbound sends key off message_thread_id; a native DM topic id must not replace it."""
+    adapter = _make_adapter()
+    event = adapter._build_message_event(
+        _private_message(thread_id=400003, is_topic_message=True, direct_topic_id=9000000000001),
+        MessageType.TEXT,
+    )
+    assert event.source.thread_id == "400003"
+
+
+def test_private_reply_to_topic_created_keeps_its_lane():
+    """The first message in a new DM topic replies to forum_topic_created and is still that topic."""
+    adapter = _make_adapter()
+    message = _private_message(thread_id=400010, is_topic_message=False, reply=True)
+    message.reply_to_message.forum_topic_created = SimpleNamespace(name="проверка топиков")
+    event = adapter._build_message_event(message, MessageType.TEXT)
+    assert event.source.thread_id == "400010"
+
+
+def test_lobby_text_binds_to_topic_created_just_before_it():
+    adapter = _make_adapter()
+    adapter._note_private_topic_created("439339988", "400011")
+    adapter._note_private_topic_created("439339988", "400012")
+    from gateway.session import SessionSource
+
+    def _lobby(text):
+        return MessageEvent(
+            text=text, message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.TELEGRAM, chat_id="439339988", chat_type="dm",
+                user_id="439339988", thread_id=None,
+            ),
+        )
+
+    first, second = _lobby("one"), _lobby("two")
+    adapter._attach_pending_private_topic(first)
+    adapter._attach_pending_private_topic(second)
+    assert first.source.thread_id == "400011"
+    assert second.source.thread_id == "400012"
+    assert first.metadata["telegram_dm_topic_created_for_send"] is True
+    assert _reply_anchor_for_event(first) is None
+    meta = _thread_metadata_for_event(first)
+    assert meta["thread_id"] == "400011"
+    assert meta["telegram_dm_topic_created_for_send"] is True
+    assert "telegram_reply_to_message_id" not in meta
+    assert "direct_messages_topic_id" not in meta
+
+
+def test_lobby_command_does_not_consume_a_new_topic():
+    adapter = _make_adapter()
+    adapter._note_private_topic_created("439339988", "400013")
+    from gateway.session import SessionSource
+
+    command = MessageEvent(
+        text="/help", message_type=MessageType.COMMAND,
+        source=SessionSource(
+            platform=Platform.TELEGRAM, chat_id="439339988", chat_type="dm",
+            user_id="439339988", thread_id=None,
+        ),
+    )
+    adapter._attach_pending_private_topic(command)
+    assert command.source.thread_id is None
+    text = MessageEvent(
+        text="hello", message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM, chat_id="439339988", chat_type="dm",
+            user_id="439339988", thread_id=None,
+        ),
+    )
+    adapter._attach_pending_private_topic(text)
+    assert text.source.thread_id == "400013"
+
+
+def test_stale_private_topic_is_not_bound():
+    adapter = _make_adapter()
+    adapter._note_private_topic_created("439339988", "400014")
+    queue = adapter._private_topic_queues()["439339988"]
+    queue[0] = (queue[0][0] - adapter._PRIVATE_TOPIC_PAIR_TTL_S - 1, queue[0][1])
+    from gateway.session import SessionSource
+
+    event = MessageEvent(
+        text="late", message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM, chat_id="439339988", chat_type="dm",
+            user_id="439339988", thread_id=None,
+        ),
+    )
+    adapter._attach_pending_private_topic(event)
+    assert event.source.thread_id is None
+
+
+def _lobby_host(adapter):
+    from gateway.run_topics import GatewayTopicThreadsMixin
+
+    class Host(GatewayTopicThreadsMixin):
+        def _delivery_adapter_for(self, _source):
+            return adapter
+
+        def _sanitize_telegram_topic_title(self, title):
+            return " ".join(str(title or "").split())[:120] or "Чат Hermes"
+
+    return Host()
+
+
+@pytest.mark.asyncio
+async def test_lobby_message_claims_topic_telegram_just_created():
+    adapter = SimpleNamespace(
+        claim_pending_private_topic=lambda _chat: "398852",
+        _create_dm_topic=AsyncMock(),
+    )
+    event = MessageEvent(
+        text="проверка топиков", message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM, chat_id="439339988", chat_type="dm",
+            user_id="439339988", thread_id="1",
+        ),
+        message_id="77",
+    )
+    source = await _lobby_host(adapter)._materialize_telegram_lobby_topic(event, event.source)
+    assert source.thread_id == "398852"
+    assert event.metadata["telegram_dm_topic_created_for_send"] is True
+    adapter._create_dm_topic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_lobby_message_creates_topic_when_telegram_did_not():
+    adapter = SimpleNamespace(
+        claim_pending_private_topic=lambda _chat: None,
+        _create_dm_topic=AsyncMock(return_value=400099),
+    )
+    event = MessageEvent(
+        text="новый чат без топика", message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM, chat_id="439339988", chat_type="dm",
+            user_id="439339988", thread_id=None,
+        ),
+        message_id="78",
+    )
+    source = await _lobby_host(adapter)._materialize_telegram_lobby_topic(event, event.source)
+    assert source.thread_id == "400099"
+    adapter._create_dm_topic.assert_awaited_once()
+    assert adapter._create_dm_topic.await_args.args[0] == 439339988
+
+
+@pytest.mark.asyncio
+async def test_lobby_command_stays_in_all_messages():
+    adapter = SimpleNamespace(
+        claim_pending_private_topic=lambda _chat: "398852",
+        _create_dm_topic=AsyncMock(),
+    )
+    event = MessageEvent(
+        text="/help", message_type=MessageType.COMMAND,
+        source=SessionSource(
+            platform=Platform.TELEGRAM, chat_id="439339988", chat_type="dm",
+            user_id="439339988", thread_id="1",
+        ),
+    )
+    assert await _lobby_host(adapter)._materialize_telegram_lobby_topic(event, event.source) is None
+    adapter._create_dm_topic.assert_not_awaited()
+
+
+def test_general_dm_text_waits_for_topic_created():
+    """All Messages is thread 1. Flushing it immediately drops the topic Telegram is about to open."""
+    adapter = _make_adapter()
+    adapter._text_batch_delay_seconds = 0.18
+    adapter._text_batch_split_delay_seconds = 1.0
+    adapter._PRIVATE_TOPIC_PAIR_DELAY_S = 1.5
+    from gateway.session import SessionSource
+
+    general = MessageEvent(
+        text="новый чат", message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM, chat_id="439339988", chat_type="dm",
+            user_id="439339988", thread_id="1",
+        ),
+    )
+    topic = MessageEvent(
+        text="внутри", message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM, chat_id="439339988", chat_type="dm",
+            user_id="439339988", thread_id="398852",
+        ),
+    )
+    assert adapter._text_batch_delay_for(general) >= 1.5
+    assert adapter._text_batch_delay_for(topic) == 0.18
+
+
+def test_fresh_lobby_prompt_is_not_pinned_to_the_last_topic():
+    from gateway.session import SessionSource
+
+    adapter = _make_adapter()
+    adapter._topic_recovery_fn = lambda _source: "397380"
+    event = MessageEvent(
+        text="проверка топиков 2",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM, chat_id="439339988", chat_type="dm",
+            user_id="439339988", thread_id=None,
+        ),
+    )
+    adapter._apply_topic_recovery(event)
+    assert event.source.thread_id is None
+
+    event.reply_to_message_id = "2999"
+    adapter._apply_topic_recovery(event)
+    assert event.source.thread_id == "397380"
 
 

@@ -1364,10 +1364,14 @@ class GatewayInboundMixin:
         # conversational "yes" would execute a dangerous command.
         if not is_internal:
             if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
-                # Debounced so a user who forgets about topic mode doesn't get ten reminders.
-                if self._should_send_telegram_lobby_reminder(source):
-                    return self._telegram_topic_root_lobby_message()
-                return None
+                opened = await self._materialize_telegram_lobby_topic(event, source)
+                if opened is None:
+                    # Debounced so a user who forgets about topic mode doesn't get ten reminders.
+                    if self._should_send_telegram_lobby_reminder(source):
+                        return self._telegram_topic_root_lobby_message()
+                    return None
+                source = opened
+                _quick_key = self._session_key_for_source(source)
             # External-drain new-turn gate: when NAS engaged an external drain (.drain_request.json,
             # seen by _drain_control_watcher), refuse to START new turns so the in-flight set can
             # only fall to zero. Reversible.

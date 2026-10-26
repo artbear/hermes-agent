@@ -17,7 +17,7 @@ from agent.compaction_display import project_compaction_message_for_display
 from agent.i18n import t
 from gateway.config import Platform
 from gateway.platforms.base import _prefix_within_utf16_limit, utf16_len
-from gateway.platforms.event import MessageEvent
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 from gateway.session_identity import replace_source
 from utils import is_truthy_value
@@ -126,6 +126,48 @@ class GatewayTopicThreadsMixin:
 
     def _telegram_topic_root_lobby_message(self) -> str:
         return t("gateway.topic.root_lobby")
+
+    async def _materialize_telegram_lobby_topic(self, event: MessageEvent, source: SessionSource) -> Optional[SessionSource]:
+        """Open a private-chat topic for a normal All Messages prompt and retarget ``event``.
+
+        Telegram's "send any message in All Messages" flow often leaves the text in General
+        and only emits ``forum_topic_created``. Replying in General is what the user sees as
+        "the topic was not created". Claim that fresh topic, or create one, then deliver the
+        answer into it without quoting the General message.
+        """
+        if getattr(event, "message_type", None) == MessageType.COMMAND or str(getattr(event, "text", "") or "").lstrip().startswith("/"):
+            return None
+        adapter = self._delivery_adapter_for(source)
+        if adapter is None or not source.chat_id:
+            return None
+        claim = getattr(adapter, "claim_pending_private_topic", None)
+        thread_id = claim(str(source.chat_id)) if callable(claim) else None
+        if not thread_id:
+            create_topic = getattr(adapter, "_create_dm_topic", None)
+            if not callable(create_topic):
+                return None
+            title = self._sanitize_telegram_topic_title((str(getattr(event, "text", "") or "").splitlines() or [""])[0])
+            try:
+                try:
+                    chat_arg = int(source.chat_id)
+                except (TypeError, ValueError):
+                    chat_arg = source.chat_id
+                created = await create_topic(chat_arg, title)
+            except Exception:
+                logger.debug("Failed to create Telegram topic for lobby message", exc_info=True)
+                return None
+            if not created:
+                return None
+            thread_id = str(created)
+        source = replace_source(source, thread_id=str(thread_id))
+        event.source = source
+        meta = getattr(event, "metadata", None)
+        if not isinstance(meta, dict):
+            meta = {}
+            event.metadata = meta
+        meta["telegram_dm_topic_created_for_send"] = True
+        logger.info("Opened Telegram DM topic %s for lobby chat %s", thread_id, source.chat_id)
+        return source
 
     def _telegram_topic_root_new_message(self) -> str:
         return t("gateway.topic.root_new")

@@ -521,6 +521,11 @@ class TelegramAdapter(BasePlatformAdapter):
     MEDIA_GROUP_WAIT_SECONDS = 0.8
     HELD_INBOUND_MAX = 64  # inbound events held across a disconnect window; oldest dropped first
     _GENERAL_TOPIC_THREAD_ID = "1"
+    # A DM topic created from All Messages / the topic list arrives as forum_topic_created,
+    # while the user's text often lands in General (no thread id, or thread 1) just before
+    # or after that service message. Pair them inside this window.
+    _PRIVATE_TOPIC_PAIR_TTL_S = 8.0
+    _PRIVATE_TOPIC_PAIR_DELAY_S = 1.5
     # send() can race a disconnect blip; failing "Not connected" (retryable=False) parks the answer in the
     # delivery ledger until next boot, so wait briefly for _bot (or a replacement adapter) instead.
     _RECONNECT_WAIT_SECONDS = 15.0
@@ -2981,6 +2986,9 @@ class TelegramAdapter(BasePlatformAdapter):
         """Register every PTB handler on ``app`` (initial connect and the transient-init rebuild)."""
         table = getattr(app, "handlers", None)
         core_before = {g: len(hs) for g, hs in table.items()} if isinstance(table, dict) else {}
+        topic_created = getattr(getattr(filters, "StatusUpdate", None), "FORUM_TOPIC_CREATED", None)
+        if topic_created is not None:
+            app.add_handler(TelegramMessageHandler(topic_created, self._handle_forum_topic_created))
         app.add_handler(TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text_message))
         app.add_handler(TelegramMessageHandler(filters.COMMAND, self._handle_command))
         app.add_handler(TelegramMessageHandler(
@@ -5941,11 +5949,35 @@ class TelegramAdapter(BasePlatformAdapter):
         is_topic_message = bool(getattr(message, "is_topic_message", False))
         is_group = chat_type in ("group", "supergroup")
         is_forum_group = is_group and getattr(chat, "is_forum", False) is True
+        if chat_type == "private":
+            private_topic = cls._private_dm_topic_id(message, raw, is_topic_message)
+            if private_topic is not None:
+                return private_topic
         if raw is not None:
-            if is_forum_group or (is_group and is_topic_message) or (chat_type == "private" and is_topic_message):
+            if is_forum_group or (is_group and is_topic_message):
                 return str(raw)
             return None
         return cls._GENERAL_TOPIC_THREAD_ID if is_forum_group else None
+
+    @classmethod
+    def _private_dm_topic_id(cls, message: Message, raw: Any, is_topic_message: bool) -> Optional[str]:
+        """Topic lane for a private chat.
+
+        A non-reply ``message_thread_id`` is the forum topic even when Telegram omits
+        ``is_topic_message`` on a freshly created DM topic. A reply to the
+        ``forum_topic_created`` service message is that topic's first message, not a
+        reply-UI anchor. Any other reply without the flag keeps the anchor-only reading.
+        ``direct_messages_topic.topic_id`` is used only when no forum thread id is present.
+        """
+        reply = getattr(message, "reply_to_message", None)
+        reply_opens_topic = bool(getattr(reply, "forum_topic_created", None)) if reply is not None else False
+        if raw is not None and (is_topic_message or reply is None or reply_opens_topic):
+            return str(raw)
+        direct = getattr(message, "direct_messages_topic", None)
+        direct_id = getattr(direct, "topic_id", None) if direct is not None else None
+        if cls._is_id_like(direct_id) and not isinstance(direct_id, bool):
+            return str(direct_id)
+        return None
 
     # Decides only whether a FOREIGN @handle is bot-shaped; our own handle is matched by identity, never
     # shape (collectible/Fragment bot usernames need not end in "bot").
@@ -6593,8 +6625,127 @@ class TelegramAdapter(BasePlatformAdapter):
 
     # -- Text message aggregation (handles Telegram client-side splits) --
 
+    def _private_topic_queues(self) -> Dict[str, Any]:
+        queues = getattr(self, "_pending_private_topics", None)
+        if queues is None:
+            queues = {}
+            self._pending_private_topics = queues
+        return queues
+
+    def _note_private_topic_created(self, chat_id: str, thread_id: str) -> None:
+        """Remember a just-created private forum topic until its opening text arrives."""
+        from collections import deque
+
+        chat_id, thread_id = str(chat_id), str(thread_id)
+        if not chat_id or thread_id in {"", self._GENERAL_TOPIC_THREAD_ID}:
+            return
+        queues = self._private_topic_queues()
+        queue = queues.get(chat_id)
+        if queue is None:
+            queue = deque()
+            queues[chat_id] = queue
+        now = time.monotonic()
+        while queue and now - queue[0][0] > self._PRIVATE_TOPIC_PAIR_TTL_S:
+            queue.popleft()
+        queue.append((now, thread_id))
+
+    def _discard_private_topic(self, chat_id: str, thread_id: str) -> None:
+        """Drop a pending topic id that the opening text already carried itself."""
+        queue = self._private_topic_queues().get(str(chat_id))
+        if not queue:
+            return
+        thread_id = str(thread_id)
+        kept = [item for item in queue if item[1] != thread_id]
+        queue.clear()
+        queue.extend(kept)
+
+    def _claim_private_topic(self, chat_id: str) -> Optional[str]:
+        """Oldest still-fresh topic created in this private chat, or None."""
+        queue = self._private_topic_queues().get(str(chat_id))
+        if not queue:
+            return None
+        now = time.monotonic()
+        while queue and now - queue[0][0] > self._PRIVATE_TOPIC_PAIR_TTL_S:
+            queue.popleft()
+        if not queue:
+            return None
+        return queue.popleft()[1]
+
+    def _attach_pending_private_topic(self, event: MessageEvent) -> None:
+        """Bind a thread-less private text to a topic Telegram just created.
+
+        Slash commands stay in the lobby. A text that already names its topic consumes
+        that pending id so the next lobby message cannot inherit it.
+        """
+        source = getattr(event, "source", None)
+        if source is None or getattr(source, "chat_type", None) != "dm" or not getattr(source, "chat_id", None):
+            return
+        current = str(getattr(source, "thread_id", None) or "")
+        if current and current != self._GENERAL_TOPIC_THREAD_ID:
+            self._discard_private_topic(source.chat_id, current)
+            return
+        if getattr(event, "message_type", None) == MessageType.COMMAND or str(getattr(event, "text", "") or "").startswith("/"):
+            return
+        claimed = self._claim_private_topic(str(source.chat_id))
+        if not claimed:
+            return
+        from gateway.session_identity import replace_source
+
+        event.source = replace_source(source, thread_id=claimed)
+        # The opening text itself stayed in All Messages. Replying to that message id
+        # paints the answer back into General; deliver into the new topic without that anchor.
+        meta = getattr(event, "metadata", None)
+        if not isinstance(meta, dict):
+            meta = {}
+            event.metadata = meta
+        meta["telegram_dm_topic_created_for_send"] = True
+        logger.info(
+            "[Telegram] Bound DM text to new topic chat=%s thread=%s", source.chat_id, claimed)
+
+    def claim_pending_private_topic(self, chat_id: str) -> Optional[str]:
+        """Pop a private topic Telegram just created for this chat, if it is still fresh."""
+        return self._claim_private_topic(str(chat_id))
+
+    async def _handle_forum_topic_created(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Cache a private-chat topic id so the following text is not treated as the lobby."""
+        msg = self._effective_update_message(update)
+        if msg is None or not getattr(msg, "forum_topic_created", None):
+            return
+        chat = getattr(msg, "chat", None)
+        if self._chat_type_str(chat) != "private":
+            return
+        raw = getattr(msg, "message_thread_id", None)
+        if not self._is_id_like(raw) or str(raw) in {"", self._GENERAL_TOPIC_THREAD_ID}:
+            return
+        self._note_private_topic_created(self._chat_id_str(msg), str(raw))
+        logger.info("[Telegram] DM forum topic created chat=%s thread=%s", getattr(chat, "id", None), raw)
+
+    def _reuse_open_private_topic_batch(self, event: MessageEvent) -> None:
+        """Keep a client-split continuation on the topic its first chunk just claimed."""
+        source = getattr(event, "source", None)
+        if source is None or getattr(source, "thread_id", None) or getattr(source, "chat_type", None) != "dm":
+            return
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        if not chat_id:
+            return
+        for pending in (getattr(self, "_pending_text_batches", None) or {}).values():
+            pending_source = getattr(pending, "source", None)
+            if pending_source is None or str(getattr(pending_source, "chat_id", "") or "") != chat_id:
+                continue
+            thread_id = str(getattr(pending_source, "thread_id", "") or "")
+            if not thread_id or thread_id == self._GENERAL_TOPIC_THREAD_ID:
+                continue
+            if len(getattr(pending, "text", "") or "") < self._SPLIT_THRESHOLD - 200:
+                continue
+            from gateway.session_identity import replace_source
+
+            event.source = replace_source(source, thread_id=thread_id)
+            return
+
     def _text_batch_key(self, event: MessageEvent) -> str:
         """Session-scoped batching key; topic recovery first so DM-topic batches coalesce on the recovered lane."""
+        self._reuse_open_private_topic_batch(event)
+        self._attach_pending_private_topic(event)
         self._apply_topic_recovery(event)
         return super()._text_batch_key(event)
 
@@ -6643,12 +6794,25 @@ class TelegramAdapter(BasePlatformAdapter):
         last_len = getattr(pending, "_last_chunk_len", 0) if pending else 0
         total_len = len(getattr(pending, "text", "") or "") if pending else 0
         if last_len >= self._SPLIT_THRESHOLD:
-            return self._text_batch_split_delay_seconds
-        if total_len <= self._TEXT_BATCH_FAST_LEN:
-            return min(self._text_batch_delay_seconds, self._TEXT_BATCH_FAST_DELAY_S)
-        if total_len <= self._TEXT_BATCH_SHORT_LEN:
-            return min(self._text_batch_delay_seconds, self._TEXT_BATCH_SHORT_DELAY_S)
-        return self._text_batch_delay_seconds
+            delay = self._text_batch_split_delay_seconds
+        elif total_len <= self._TEXT_BATCH_FAST_LEN:
+            delay = min(self._text_batch_delay_seconds, self._TEXT_BATCH_FAST_DELAY_S)
+        elif total_len <= self._TEXT_BATCH_SHORT_LEN:
+            delay = min(self._text_batch_delay_seconds, self._TEXT_BATCH_SHORT_DELAY_S)
+        else:
+            delay = self._text_batch_delay_seconds
+        source = getattr(pending, "source", None)
+        # Leave the flush open long enough for forum_topic_created to arrive after the text.
+        # General ("Все") is thread "1" or missing; both are the lobby, not a real topic.
+        thread_id = str(getattr(source, "thread_id", None) or "") if source is not None else ""
+        if source is not None and getattr(source, "chat_type", None) == "dm" and thread_id in {"", self._GENERAL_TOPIC_THREAD_ID}:
+            delay = max(delay, self._PRIVATE_TOPIC_PAIR_DELAY_S)
+        return delay
+
+    def _log_text_flush(self, key: str, event: MessageEvent) -> None:
+        """Bind a topic that arrived during the quiet period, then log the flush."""
+        self._attach_pending_private_topic(event)
+        logger.info("[Telegram] Flushing text batch %s (%d chars)", key, len(event.text or ""))
 
     async def _flush_text_batch(self, key: str) -> None:
         """Telegram keeps its own flush body: a cancel after the pop must HOLD the event and re-raise
@@ -6657,7 +6821,7 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._flush_buffered(
             self._pending_text_batches, self._pending_text_batch_tasks, key,
             self._text_batch_delay_for(self._pending_text_batches.get(key)), "text",
-            lambda ev: logger.info("[Telegram] Flushing text batch %s (%d chars)", key, len(ev.text or "")))
+            lambda ev: self._log_text_flush(key, ev))
 
     # -- Photo batching --
 

@@ -142,9 +142,24 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     return metadata
 
 
+def _dm_topic_opened_for_send(event) -> bool:
+    """True when this turn adopted or created a DM topic for a message that stayed in All Messages."""
+    meta = getattr(event, "metadata", None)
+    return bool(isinstance(meta, dict) and meta.get("telegram_dm_topic_created_for_send"))
+
+
 def _thread_metadata_for_event(event) -> dict | None:
     """``_thread_metadata_for_source`` for an event, anchored on its reply id."""
-    return _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+    metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+    if not _dm_topic_opened_for_send(event):
+        return metadata
+    metadata = dict(metadata or {})
+    metadata["telegram_dm_topic_created_for_send"] = True
+    # The user's message is still in All Messages. Anchoring or using the native DM-topic id
+    # sends the answer back there instead of into the topic we just opened.
+    metadata.pop("telegram_reply_to_message_id", None)
+    metadata.pop("direct_messages_topic_id", None)
+    return metadata
 
 
 def _mark_notify_metadata(metadata: dict | None) -> dict:
@@ -172,6 +187,8 @@ def _reply_anchor_for_event(event) -> str | None:
         # Forum topics route by topic metadata (no reply); DM-topic lanes reply to the triggering
         # message — replying to the topic seed/anchor can render outside the active lane.
         if getattr(source, "chat_type", None) != "dm":
+            return None
+        if _dm_topic_opened_for_send(event):
             return None
         return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
     if platform == "feishu" and thread_id and getattr(event, "reply_to_message_id", None):
@@ -2375,10 +2392,18 @@ class BasePlatformAdapter(ABC):
         self._topic_recovery_fn = fn
 
     def _apply_topic_recovery(self, event: MessageEvent) -> None:
-        """Rewrite ``event.source.thread_id`` in place if the hook returns one."""
+        """Rewrite ``event.source.thread_id`` in place if the hook returns one.
+
+        Fresh lobby prompts (no reply anchor) stay in the lobby. Pinning them to the
+        last topic makes every new Telegram DM topic land in the previous session.
+        Recovery remains for replies whose ``message_thread_id`` was stripped.
+        """
         recover = getattr(self, "_topic_recovery_fn", None)
         source = getattr(event, "source", None)
         if recover is None or source is None:
+            return
+        inbound = str(getattr(source, "thread_id", None) or "")
+        if inbound in {"", "1"} and not getattr(event, "reply_to_message_id", None):
             return
         try:
             recovered = recover(source)
