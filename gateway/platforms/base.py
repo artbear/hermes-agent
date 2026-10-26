@@ -131,7 +131,7 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         metadata["telegram_dm_topic_reply_fallback"] = True
         if str(thread_id) not in {"", "1"}:
             metadata["direct_messages_topic_id"] = str(thread_id)
-        anchor = reply_to_message_id or getattr(source, "message_id", None)
+        anchor = _reply_anchor_unless_opened_topic(source, reply_to_message_id)
         if anchor is not None:
             metadata["telegram_reply_to_message_id"] = str(anchor)
     # Routed profile (multiplex / profile_routes): outbound prune paths must not assume the
@@ -139,6 +139,35 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     profile = str(getattr(source, "profile", None) or "").strip()
     if profile:
         metadata["hermes_profile"] = profile
+    return _apply_opened_dm_topic_send_metadata(source, metadata)
+
+
+_OPENED_DM_TOPIC_ATTR = "_telegram_dm_topic_opened_for_send"
+
+
+def mark_telegram_dm_topic_opened_for_send(source) -> None:
+    """The user's text stayed in All Messages. Do not quote ``source.message_id`` on the way out."""
+    setattr(source, _OPENED_DM_TOPIC_ATTR, True)
+
+
+def _reply_anchor_unless_opened_topic(source, reply_to_message_id):
+    """Reply anchor for a DM send. An opened All Messages topic has none: quoting the lobby message paints the answer back into Все."""
+    if getattr(source, _OPENED_DM_TOPIC_ATTR, False) is True:
+        return None
+    return reply_to_message_id or getattr(source, "message_id", None)
+
+
+def _apply_opened_dm_topic_send_metadata(source, metadata):
+    """Drop the lobby quote and the native DM-topic id so the send stays on ``message_thread_id``."""
+    if getattr(source, _OPENED_DM_TOPIC_ATTR, False) is not True:
+        return metadata
+    metadata = dict(metadata or {})
+    metadata["telegram_dm_topic_created_for_send"] = True
+    thread_id = getattr(source, "thread_id", None)
+    if thread_id is not None:
+        metadata["thread_id"] = thread_id
+    metadata.pop("telegram_reply_to_message_id", None)
+    metadata.pop("direct_messages_topic_id", None)
     return metadata
 
 

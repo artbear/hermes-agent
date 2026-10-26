@@ -410,8 +410,13 @@ class GatewayTurnMixin:
         # cross-topic Reply doesn't fragment the conversation.
         event_metadata = getattr(event, "metadata", None) or {}
         expected_session_key = str(event_metadata.get("gateway_session_key") or "").strip()
+        inbound_thread = str(source.thread_id or "")
+        recover_lobby_reply = (
+            inbound_thread not in self._TELEGRAM_GENERAL_TOPIC_IDS
+            or bool(getattr(event, "reply_to_message_id", None))
+        )
         recovered = (await asyncio.to_thread(self._recover_telegram_topic_thread_id, source)
-                     if not expected_session_key else None)
+                     if not expected_session_key and recover_lobby_reply else None)
         if recovered is not None:
             logger.info(
                 "telegram topic recovery: chat=%s user=%s %r -> %s",
@@ -2155,6 +2160,11 @@ class GatewayTurnMixin:
         if resolved is None:
             return
         source, session_entry, session_key = resolved
+        from gateway.platforms.base import (
+            _dm_topic_opened_for_send, mark_telegram_dm_topic_opened_for_send,
+        )
+        if _dm_topic_opened_for_send(event):
+            mark_telegram_dm_topic_opened_for_send(source)
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,
         )

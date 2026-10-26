@@ -4169,10 +4169,13 @@ class GatewayRunner(
     def _thread_metadata_for_source(
         self, source, reply_to_message_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Build the metadata dict platforms need for thread-aware replies."""
+        from gateway.platforms.base import (
+            _apply_opened_dm_topic_send_metadata, _reply_anchor_unless_opened_topic,
+        )
         metadata = self._thread_metadata_for_target(
             getattr(source, "platform", None), getattr(source, "chat_id", None),
             getattr(source, "thread_id", None), chat_type=getattr(source, "chat_type", None),
-            reply_to_message_id=reply_to_message_id or getattr(source, "message_id", None))
+            reply_to_message_id=_reply_anchor_unless_opened_topic(source, reply_to_message_id))
         if getattr(source, "platform", None) == Platform.SLACK:
             # Per-turn egress identity: Slack chat.startStream needs recipient_user_id/team_id; the relay
             # adapter's _with_scope fallback reads per-chat caches a CONCURRENT turn overwrites.
@@ -4202,7 +4205,7 @@ class GatewayRunner(
         if profile and metadata is not None:
             metadata = dict(metadata)
             metadata["hermes_profile"] = profile
-        return metadata
+        return _apply_opened_dm_topic_send_metadata(source, metadata)
 
     def _thread_metadata_for_target(
         self, platform: Optional[Platform], chat_id: Optional[str], thread_id: Optional[str], *,

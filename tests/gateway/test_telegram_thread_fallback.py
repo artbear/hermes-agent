@@ -19,9 +19,12 @@ import pytest
 from gateway.config import PlatformConfig, Platform
 from gateway.platforms.base import (
     SendResult,
+    _apply_opened_dm_topic_send_metadata,
     _reply_anchor_for_event,
+    _reply_anchor_unless_opened_topic,
     _thread_metadata_for_event,
     _thread_metadata_for_source,
+    mark_telegram_dm_topic_opened_for_send,
 )
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
@@ -279,6 +282,58 @@ async def test_private_dm_topic_reply_fallback_without_anchor_fails_loud():
     assert result.retryable is False
     assert result.error == adapter._dm_topic_missing_anchor_error()
     assert call_log == []
+
+
+def test_opened_all_messages_topic_does_not_quote_the_lobby_message():
+    """Quoting the Все message paints the answer back there, even with message_thread_id set."""
+    source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="439339988", chat_type="dm",
+        user_id="439339988", thread_id="398852", message_id="77",
+    )
+    mark_telegram_dm_topic_opened_for_send(source)
+    metadata = _thread_metadata_for_source(source, "77")
+    assert metadata["thread_id"] == "398852"
+    assert metadata["telegram_dm_topic_created_for_send"] is True
+    assert "telegram_reply_to_message_id" not in metadata
+    assert "direct_messages_topic_id" not in metadata
+    # The turn's stream metadata is built the same way as GatewayRunner._thread_metadata_for_source:
+    # a None anchor used to fall back to source.message_id and quote the Все message.
+    assert _reply_anchor_unless_opened_topic(source, None) is None
+    assert _reply_anchor_unless_opened_topic(source, "77") is None
+    cleaned = _apply_opened_dm_topic_send_metadata(source, {
+        "thread_id": "398852",
+        "telegram_dm_topic_reply_fallback": True,
+        "direct_messages_topic_id": "398852",
+        "telegram_reply_to_message_id": "77",
+    })
+    assert cleaned["telegram_dm_topic_created_for_send"] is True
+    assert "telegram_reply_to_message_id" not in cleaned
+    assert "direct_messages_topic_id" not in cleaned
+
+
+@pytest.mark.asyncio
+async def test_opened_all_messages_topic_sends_into_the_topic_without_reply():
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=270455)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+    source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="439339988", chat_type="dm",
+        user_id="439339988", thread_id="398852", message_id="77",
+    )
+    mark_telegram_dm_topic_opened_for_send(source)
+    result = await adapter.send(
+        chat_id="439339988", content="ответ в топике",
+        metadata=_thread_metadata_for_source(source, "77"),
+    )
+    assert result.success is True
+    assert call_log[0]["message_thread_id"] == 398852
+    assert call_log[0]["reply_to_message_id"] is None
+    assert "direct_messages_topic_id" not in call_log[0]
 
 
 def test_base_gateway_metadata_marks_telegram_dm_topics_as_reply_fallback():

@@ -6692,6 +6692,8 @@ class TelegramAdapter(BasePlatformAdapter):
         from gateway.session_identity import replace_source
 
         event.source = replace_source(source, thread_id=claimed)
+        from gateway.platforms.base import mark_telegram_dm_topic_opened_for_send
+        mark_telegram_dm_topic_opened_for_send(event.source)
         # The opening text itself stayed in All Messages. Replying to that message id
         # paints the answer back into General; deliver into the new topic without that anchor.
         meta = getattr(event, "metadata", None)

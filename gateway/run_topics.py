@@ -160,6 +160,8 @@ class GatewayTopicThreadsMixin:
                 return None
             thread_id = str(created)
         source = replace_source(source, thread_id=str(thread_id))
+        from gateway.platforms.base import mark_telegram_dm_topic_opened_for_send
+        mark_telegram_dm_topic_opened_for_send(source)
         event.source = source
         meta = getattr(event, "metadata", None)
         if not isinstance(meta, dict):
