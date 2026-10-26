@@ -873,6 +873,81 @@ def test_lobby_text_binds_to_topic_created_just_before_it():
     assert "direct_messages_topic_id" not in meta
 
 
+def test_lobby_command_claims_topic_it_just_opened():
+    """A slash command sent from Все is the message Telegram wrapped in the new topic."""
+    adapter = _make_adapter()
+    adapter._note_private_topic_created("439339988", "398852")
+    from gateway.session import SessionSource
+
+    command = MessageEvent(
+        text="/help", message_type=MessageType.COMMAND,
+        source=SessionSource(
+            platform=Platform.TELEGRAM, chat_id="439339988", chat_type="dm",
+            user_id="439339988", thread_id="1",
+        ),
+        message_id="81",
+    )
+    adapter._attach_pending_private_topic(command, allow_command=True)
+    assert command.source.thread_id == "398852"
+    assert command.metadata["telegram_dm_topic_created_for_send"] is True
+    assert _reply_anchor_for_event(command) is None
+
+
+@pytest.mark.asyncio
+async def test_lobby_command_bind_waits_until_topic_created(monkeypatch):
+    adapter = _make_adapter()
+    adapter._PRIVATE_TOPIC_PAIR_DELAY_S = 1.5
+    slept = {}
+
+    async def _sleep(delay):
+        slept["delay"] = delay
+        adapter._note_private_topic_created("439339988", "398852")
+
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.asyncio.sleep", _sleep,
+    )
+    from gateway.session import SessionSource
+
+    command = MessageEvent(
+        text="/status", message_type=MessageType.COMMAND,
+        source=SessionSource(
+            platform=Platform.TELEGRAM, chat_id="439339988", chat_type="dm",
+            user_id="439339988", thread_id=None,
+        ),
+    )
+    await adapter._bind_lobby_command_to_fresh_topic(command)
+    assert slept["delay"] == 1.5
+    assert command.source.thread_id == "398852"
+
+
+@pytest.mark.asyncio
+async def test_lobby_command_bind_skips_wait_when_topic_already_pending():
+    adapter = _make_adapter()
+
+    async def _sleep(_delay):
+        raise AssertionError("topic was already pending")
+
+    adapter._note_private_topic_created("439339988", "398852")
+    import plugins.platforms.telegram.adapter as telegram_mod
+    # no monkeypatch: sleep must not be called; guard by replacing asyncio.sleep on the module
+    original = telegram_mod.asyncio.sleep
+    telegram_mod.asyncio.sleep = _sleep
+    try:
+        from gateway.session import SessionSource
+
+        command = MessageEvent(
+            text="/status", message_type=MessageType.COMMAND,
+            source=SessionSource(
+                platform=Platform.TELEGRAM, chat_id="439339988", chat_type="dm",
+                user_id="439339988", thread_id="1",
+            ),
+        )
+        await adapter._bind_lobby_command_to_fresh_topic(command)
+    finally:
+        telegram_mod.asyncio.sleep = original
+    assert command.source.thread_id == "398852"
+
+
 def test_lobby_command_does_not_consume_a_new_topic():
     adapter = _make_adapter()
     adapter._note_private_topic_created("439339988", "400013")

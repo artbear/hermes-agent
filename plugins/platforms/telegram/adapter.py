@@ -6588,6 +6588,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if len(event.text or "") >= self._SPLIT_THRESHOLD:
             self._enqueue_text_event(event)
             return
+        await self._bind_lobby_command_to_fresh_topic(event)
         await self.handle_message(event)
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6671,11 +6672,39 @@ class TelegramAdapter(BasePlatformAdapter):
             return None
         return queue.popleft()[1]
 
-    def _attach_pending_private_topic(self, event: MessageEvent) -> None:
-        """Bind a thread-less private text to a topic Telegram just created.
+    def _peek_private_topic(self, chat_id: str) -> Optional[str]:
+        """Oldest still-fresh topic id for this private chat, without consuming it."""
+        queue = self._private_topic_queues().get(str(chat_id))
+        if not queue:
+            return None
+        now = time.monotonic()
+        while queue and now - queue[0][0] > self._PRIVATE_TOPIC_PAIR_TTL_S:
+            queue.popleft()
+        return queue[0][1] if queue else None
 
-        Slash commands stay in the lobby. A text that already names its topic consumes
-        that pending id so the next lobby message cannot inherit it.
+    async def _bind_lobby_command_to_fresh_topic(self, event: MessageEvent) -> None:
+        """If Telegram just opened a topic for this Все command, answer inside that topic.
+
+        Command updates are not batched, so they used to be dispatched before
+        ``forum_topic_created`` was paired and the reply landed in Все. Wait only when
+        no topic is pending yet, then claim it the same way lobby text does.
+        """
+        source = getattr(event, "source", None)
+        if source is None or getattr(source, "chat_type", None) != "dm" or not getattr(source, "chat_id", None):
+            return
+        current = str(getattr(source, "thread_id", None) or "")
+        if current and current != self._GENERAL_TOPIC_THREAD_ID:
+            return
+        if self._peek_private_topic(str(source.chat_id)) is None:
+            await asyncio.sleep(self._PRIVATE_TOPIC_PAIR_DELAY_S)
+        self._attach_pending_private_topic(event, allow_command=True)
+
+    def _attach_pending_private_topic(self, event: MessageEvent, *, allow_command: bool = False) -> None:
+        """Bind a thread-less private message to a topic Telegram just created.
+
+        Slash commands stay in the lobby unless ``allow_command`` (the command itself
+        opened the topic). A text that already names its topic consumes that pending
+        id so the next lobby message cannot inherit it.
         """
         source = getattr(event, "source", None)
         if source is None or getattr(source, "chat_type", None) != "dm" or not getattr(source, "chat_id", None):
@@ -6684,7 +6713,14 @@ class TelegramAdapter(BasePlatformAdapter):
         if current and current != self._GENERAL_TOPIC_THREAD_ID:
             self._discard_private_topic(source.chat_id, current)
             return
-        if getattr(event, "message_type", None) == MessageType.COMMAND or str(getattr(event, "text", "") or "").startswith("/"):
+        is_command = (
+            getattr(event, "message_type", None) == MessageType.COMMAND
+            or str(getattr(event, "text", "") or "").startswith("/")
+        )
+        # Text batching must not let a lobby slash command steal a topic that belongs to the
+        # following prompt. The command handler opts in: that command is the message Telegram
+        # just wrapped in a new topic, and leaving it in Все keeps the topic empty.
+        if is_command and not allow_command:
             return
         claimed = self._claim_private_topic(str(source.chat_id))
         if not claimed:
