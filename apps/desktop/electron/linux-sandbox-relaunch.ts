@@ -17,12 +17,13 @@
 // `hermes desktop` — restarts once with the flag on argv instead.
 
 import { LAUNCHER_READY_FD_ENV } from './linux-launcher-ready'
-import { canRelaunch, type RelaunchHost, relaunchNow, type RelaunchStrategy, relaunchStrategy } from './relaunch-target'
+import { canRelaunch, relaunchTarget } from './relaunch-target'
 import { alreadyHasNoSandbox, buildNoSandboxRelaunchArgs } from './windows-sandbox-fallback'
 
 export interface SandboxRelaunch {
   args: string[]
-  strategy: RelaunchStrategy
+  /** The file the relaunch starts (relaunchTarget). */
+  target: string
 }
 
 // Captured when this module is evaluated, before main.ts sets
@@ -66,18 +67,23 @@ export function linuxNoSandboxRelaunch(options: {
 
   return {
     args: buildNoSandboxRelaunchArgs(options.argv.slice(1)),
-    strategy: relaunchStrategy(options.execPath ?? process.execPath, options.env)
+    target: relaunchTarget(options.execPath ?? process.execPath, options.env)
   }
 }
 
-interface SandboxRelaunchHost extends RelaunchHost {
+/** The app's relauncher (app-relaunch.ts createAppRelauncher), which owns how the target starts. */
+interface SandboxRelaunchHost {
   commandLine: { hasSwitch(name: string): boolean }
+  relaunch(options: { args: string[] }): void
   exit(code: number): void
 }
 
 // Call once, in the lock-owning instance, after every runtime switch source
-// (sandbox ladder, config.yaml) has run and before `ready`.
-export function relaunchIfNoSandboxCameTooLate(host: SandboxRelaunchHost): boolean {
+// (sandbox ladder, config.yaml) has run and before `ready`. `beforeExit` runs
+// only when this instance exits for the relaunch: a deliberate restart this
+// early must clear what a mid-boot abort would leave behind (the NVIDIA boot
+// witness), or the next launch reads it as a GPU failure.
+export function relaunchIfNoSandboxCameTooLate(host: SandboxRelaunchHost, beforeExit: () => void): boolean {
   const relaunch = linuxNoSandboxRelaunch({
     platform: process.platform,
     runtimeNoSandbox: host.commandLine.hasSwitch('no-sandbox'),
@@ -87,7 +93,7 @@ export function relaunchIfNoSandboxCameTooLate(host: SandboxRelaunchHost): boole
 
   // An image that cannot start leaves this instance running, as before the
   // relaunch existed, instead of exiting with nothing to replace it.
-  if (!relaunch || !canRelaunch(relaunch.strategy)) {
+  if (!relaunch || !canRelaunch(relaunch.target)) {
     return false
   }
 
@@ -96,8 +102,8 @@ export function relaunchIfNoSandboxCameTooLate(host: SandboxRelaunchHost): boole
   // number would make the next process write its reveal byte into whatever
   // file reuses that descriptor.
   delete process.env[LAUNCHER_READY_FD_ENV]
-  restoreLaunchTmpdir(process.env)
-  relaunchNow(host, relaunch.args, relaunch.strategy, process.env)
+  host.relaunch({ args: relaunch.args })
+  beforeExit()
   host.exit(0)
 
   return true
